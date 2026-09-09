@@ -51,3 +51,6 @@ uv run bot
 
 Umbra Development is not responsible for how this software is used. Use it
 responsibly and follow Discord's terms and applicable rules.
+
+## Join this server for more tools and any assistance if required.
+https://discord.gg/cMtCZx5YPn
