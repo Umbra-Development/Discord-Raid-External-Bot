@@ -2,13 +2,13 @@
 
 import sys
 
-from external_app_raider import PACKAGED_BOT_ARGUMENT
+from umbra_bot import PACKAGED_BOT_ARGUMENT
 
 
 def main() -> None:
     if PACKAGED_BOT_ARGUMENT in sys.argv[1:]:
         sys.argv.remove(PACKAGED_BOT_ARGUMENT)
-        from external_app_raider import main as run_bot
+        from umbra_bot import main as run_bot
 
         run_bot()
         return

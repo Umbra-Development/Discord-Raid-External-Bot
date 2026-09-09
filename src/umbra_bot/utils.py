@@ -7,7 +7,7 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 
-from external_app_raider.config import load_config
+from umbra_bot.config import load_config
 
 
 class CooldownUsage(TypedDict):

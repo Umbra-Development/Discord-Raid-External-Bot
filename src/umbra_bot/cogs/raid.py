@@ -4,11 +4,11 @@ from discord.ext import commands
 
 from typing import TYPE_CHECKING
 
-from external_app_raider import config
-from external_app_raider.utils import ConfiguredCooldown, check_cooldown
+from umbra_bot import config
+from umbra_bot.utils import ConfiguredCooldown, check_cooldown
 
 if TYPE_CHECKING:
-    from external_app_raider.bot import SyraBot
+    from umbra_bot.bot import SyraBot
 
 class RaidCog(commands.Cog):
     def __init__(self, bot: "SyraBot") -> None:

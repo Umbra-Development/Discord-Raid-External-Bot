@@ -1,3 +1,4 @@
+import re
 import subprocess
 import sys
 import time
@@ -10,8 +11,8 @@ from tkinter import messagebox
 import customtkinter as ctk
 from PIL import Image, ImageDraw, ImageTk
 
-from external_app_raider import PACKAGED_BOT_ARGUMENT
-from external_app_raider.config import CONFIG_PATH, load_config, save_config
+from umbra_bot import PACKAGED_BOT_ARGUMENT
+from umbra_bot.config import CONFIG_PATH, load_config, save_config
 from .discord_preview import DiscordMarkdownView
 
 APP_TITLE = "Umbra"
@@ -19,6 +20,8 @@ SPLASH_WORD = "Umbra"
 ORGANIZATION_URL = "https://github.com/Umbra-Development"
 LOGO_PATH = Path(__file__).with_name("assets") / "umbra-development.png"
 THEME_PATH = Path(__file__).with_name("assets") / "umbra-theme.json"
+MAX_MESSAGE_LENGTH = 2_000
+ANSI_ESCAPE = re.compile(r"\x1b(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])")
 
 # Establish Umbra before the root window or any child widget is drawn. Retain
 # the stock palette so the appearance selector can still offer standard modes.
@@ -33,6 +36,227 @@ def _scale_preference(value: object, default: int = 100) -> int:
         return max(50, min(200, int(value)))
     except (TypeError, ValueError):
         return default
+
+
+class LimitedTextbox(ctk.CTkTextbox):
+    """A CTk textbox that caps interactive inserts at Discord's limit."""
+
+    def __init__(self, *args: object, max_length: int, **kwargs: object) -> None:
+        kwargs.setdefault("activate_scrollbars", False)
+        super().__init__(*args, **kwargs)
+        self.max_length = max_length
+        self._limit_enabled = True
+        self._widget_command = self._textbox._w
+        self._original_widget_command = f"{self._widget_command}_original"
+        self.tk.call(
+            "rename", self._widget_command, self._original_widget_command
+        )
+        self.tk.createcommand(self._widget_command, self._text_command)
+
+    def _text_command(self, *arguments: object) -> object:
+        args = [str(argument) for argument in arguments]
+        if self._limit_enabled and args:
+            if args[0] == "insert" and len(args) >= 3:
+                args = self._limit_insert(args)
+                if not args:
+                    return ""
+            elif args[0] == "replace" and len(args) >= 4:
+                args = self._limit_replace(args)
+
+        return self.tk.call(self._original_widget_command, *args)
+
+    def _limit_insert(self, args: list[str]) -> list[str]:
+        available = max(0, self.max_length - len(self.get("1.0", "end-1c")))
+        return self._limit_text_arguments(args, text_start=2, available=available)
+
+    def _limit_replace(self, args: list[str]) -> list[str]:
+        current_length = len(self.get("1.0", "end-1c"))
+        replaced = self.get(args[1], args[2])
+        available = max(0, self.max_length - current_length + len(replaced))
+        limited = self._limit_text_arguments(
+            args, text_start=3, available=available
+        )
+        # Even when no inserted characters fit, replacement must still delete
+        # the selected range so an oversized legacy value can be shortened.
+        return limited or [*args[:3], ""]
+
+    @staticmethod
+    def _limit_text_arguments(
+        args: list[str], *, text_start: int, available: int
+    ) -> list[str]:
+        limited = args[:text_start]
+        for index in range(text_start, len(args), 2):
+            text = args[index][:available]
+            available -= len(text)
+            if text:
+                limited.append(text)
+                if index + 1 < len(args):
+                    limited.append(args[index + 1])
+        return limited if len(limited) > text_start else []
+
+    def replace_contents(self, value: str, *, enforce_limit: bool = True) -> None:
+        previous = self._limit_enabled
+        self._limit_enabled = enforce_limit
+        try:
+            self.delete("1.0", "end")
+            self.insert("1.0", value)
+        finally:
+            self._limit_enabled = previous
+
+    def destroy(self) -> None:
+        if self._widget_command:
+            self.tk.deletecommand(self._widget_command)
+            self.tk.call(
+                "rename", self._original_widget_command, self._widget_command
+            )
+            self._widget_command = ""
+        super().destroy()
+
+
+class ConsoleView(ctk.CTkFrame):
+    """Canvas-backed, scrollable output without a native Text input window."""
+
+    max_entries = 5_000
+
+    def __init__(self, master: ctk.CTkBaseClass) -> None:
+        super().__init__(master, corner_radius=6, fg_color="#211820")
+        self._entries: list[tuple[str, str | None]] = []
+        self._colors = {
+            "default": "#ffffe7",
+            "system": "#8e9b9d",
+            "success": "#8bd49c",
+            "warning": "#f0c674",
+            "error": "#ff8d85",
+        }
+        self._background = "#211820"
+        self._render_after_id: str | None = None
+        self.following = True
+        self._font = ctk.CTkFont(family="monospace", size=12)
+
+        self.canvas = tk.Canvas(
+            self,
+            background=self._background,
+            borderwidth=0,
+            highlightthickness=0,
+            takefocus=True,
+        )
+        self.canvas.grid(row=0, column=0, sticky="nsew", padx=3, pady=3)
+        self.grid_columnconfigure(0, weight=1)
+        self.grid_rowconfigure(0, weight=1)
+
+        self.canvas.bind("<Configure>", lambda _event: self._schedule_render())
+        self.canvas.bind("<Button-1>", self._focus)
+        self.canvas.bind("<MouseWheel>", self._scroll)
+        self.canvas.bind("<Button-4>", self._scroll)
+        self.canvas.bind("<Button-5>", self._scroll)
+        self.canvas.bind("<Control-c>", self._copy_all)
+        self.canvas.bind("<Command-c>", self._copy_all)
+
+    def append(self, value: str, tag: str | None = None) -> None:
+        lines = value.splitlines()
+        if not lines and value:
+            lines = [value]
+        self._entries.extend((line, tag) for line in lines)
+        if len(self._entries) > self.max_entries:
+            del self._entries[: len(self._entries) - self.max_entries]
+        self._schedule_render()
+
+    def clear(self) -> None:
+        self._entries.clear()
+        self._schedule_render()
+
+    def get_text(self) -> str:
+        return "\n".join(text for text, _tag in self._entries)
+
+    def set_following(self, following: bool) -> None:
+        self.following = following
+        if following:
+            self.see_end()
+
+    def see_end(self) -> None:
+        self.canvas.yview_moveto(1.0)
+
+    def set_palette(
+        self,
+        *,
+        background: str,
+        foreground: str,
+        system: str,
+        success: str,
+        warning: str,
+        error: str,
+    ) -> None:
+        self._background = background
+        self._colors = {
+            "default": foreground,
+            "system": system,
+            "success": success,
+            "warning": warning,
+            "error": error,
+        }
+        self.configure(fg_color=background)
+        self.canvas.configure(background=background)
+        self._schedule_render()
+
+    def _schedule_render(self) -> None:
+        if self._render_after_id is None and self.winfo_exists():
+            self._render_after_id = self.after_idle(self._render)
+
+    def _render(self) -> None:
+        self._render_after_id = None
+        if not self.winfo_exists():
+            return
+        canvas = self.canvas
+        canvas.delete("all")
+        width = max(20, canvas.winfo_width() - 24)
+        y = 10
+        font = self._apply_font_scaling(self._font)
+        for text, tag in self._entries:
+            item = canvas.create_text(
+                10,
+                y,
+                anchor="nw",
+                width=width,
+                text=text or " ",
+                fill=self._colors.get(tag or "default", self._colors["default"]),
+                font=font,
+            )
+            bounds = canvas.bbox(item)
+            if bounds is not None:
+                y = bounds[3] + 3
+        content_height = max(canvas.winfo_height(), y + 10)
+        canvas.configure(scrollregion=(0, 0, canvas.winfo_width(), content_height))
+        if self.following:
+            self.see_end()
+
+    def _focus(self, _event: tk.Event) -> None:
+        self.canvas.focus_set()
+
+    def _scroll(self, event: tk.Event) -> str:
+        delta = getattr(event, "delta", 0)
+        if delta:
+            direction = -1 if delta > 0 else 1
+        else:
+            direction = -1 if getattr(event, "num", None) == 4 else 1
+        self.canvas.yview_scroll(direction * 3, "units")
+        return "break"
+
+    def _copy_all(self, _event: tk.Event | None = None) -> str:
+        self.clipboard_clear()
+        self.clipboard_append(self.get_text())
+        return "break"
+
+    def _set_scaling(
+        self, widget_scaling: float, window_scaling: float
+    ) -> None:
+        super()._set_scaling(widget_scaling, window_scaling)
+        self._schedule_render()
+
+    def destroy(self) -> None:
+        if self._render_after_id is not None:
+            self.after_cancel(self._render_after_id)
+            self._render_after_id = None
+        super().destroy()
 
 
 class SettingsApp(ctk.CTk):
@@ -87,11 +311,14 @@ class SettingsApp(ctk.CTk):
         self.wait_seconds_var = ctk.StringVar()
         self.block_seconds_var = ctk.StringVar()
         self.status_var = ctk.StringVar(value=f"Editing {CONFIG_PATH}")
+        self.console_state_var = ctk.StringVar(value="Stopped")
         self.token_visible = False
+        self.console_following = True
         self.current_config: dict = bootstrap_config
         self._message_previews: dict[ctk.CTkTextbox, DiscordMarkdownView] = {}
         self.bot_process: subprocess.Popen[bytes] | None = None
         self._bot_log_file = None
+        self._bot_log_reader = None
         self._bot_poll_after_id: str | None = None
         self._bot_stop_requested = False
         self._bot_stop_deadline = 0.0
@@ -104,9 +331,14 @@ class SettingsApp(ctk.CTk):
         self._build_footer()
         self._theme_baseline: dict[ctk.CTkBaseClass, dict[str, object]] = {}
         self._capture_theme_baseline()
+        # The JSON theme supplies widget defaults, while this pass also fixes
+        # context-sensitive colors such as transparent toolbar buttons.
+        self._apply_theme("Umbra")
 
         self.bind("<Control-s>", lambda _event: self.save())
         self.bind("<Command-s>", lambda _event: self.save())
+        self.bind("<Control-l>", self._clear_console_shortcut)
+        self.bind("<Command-l>", self._clear_console_shortcut)
         self._bind_zoom_shortcuts()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         self.load()
@@ -237,6 +469,8 @@ class SettingsApp(ctk.CTk):
         if theme_name != "Umbra":
             ctk.set_appearance_mode(theme_name)
             self._apply_standard_widget_colors()
+            self._configure_console_tags()
+            self._refresh_message_counts()
             return
 
         ctk.set_appearance_mode("Dark")
@@ -335,6 +569,8 @@ class SettingsApp(ctk.CTk):
                     fg_color="transparent" if transparent else palette["surface"],
                     border_color=palette["border"],
                 )
+        self._configure_console_tags()
+        self._refresh_message_counts()
 
     def _apply_standard_widget_colors(self) -> None:
         theme = STANDARD_THEME
@@ -447,19 +683,147 @@ class SettingsApp(ctk.CTk):
 
         general_tab = self.tabs.add("General")
         messages_tab = self.tabs.add("Messages")
+        console_tab = self.tabs.add("Console")
         about_tab = self.tabs.add("About")
         self.tabs.set("General")
 
         self._build_general_tab(general_tab)
         self._build_messages_tab(messages_tab)
+        self._build_console_tab(console_tab)
         self._build_about_tab(about_tab)
+
+    def _build_console_tab(self, tab: ctk.CTkFrame) -> None:
+        tab.grid_columnconfigure(0, weight=1)
+        tab.grid_rowconfigure(1, weight=1)
+
+        toolbar = ctk.CTkFrame(tab, fg_color="transparent")
+        toolbar.grid(row=0, column=0, sticky="ew", padx=8, pady=(8, 6))
+        toolbar.grid_columnconfigure(0, weight=1)
+
+        status = ctk.CTkFrame(toolbar, fg_color="transparent")
+        status.grid(row=0, column=0, sticky="w", padx=(8, 12))
+        ctk.CTkLabel(
+            status,
+            text="BOT CONSOLE",
+            font=ctk.CTkFont(size=12, weight="bold"),
+        ).pack(side="left")
+        ctk.CTkLabel(
+            status,
+            text="•",
+            text_color=("gray38", "gray68"),
+        ).pack(side="left", padx=7)
+        ctk.CTkLabel(
+            status,
+            textvariable=self.console_state_var,
+            text_color=("gray38", "gray68"),
+        ).pack(side="left")
+
+        self.console_follow_button = ctk.CTkButton(
+            toolbar,
+            text="Follow output: On",
+            width=130,
+            fg_color="transparent",
+            border_width=1,
+            command=self._toggle_console_follow,
+        )
+        self.console_follow_button.grid(row=0, column=1, padx=(6, 8))
+        self.console_clear_button = ctk.CTkButton(
+            toolbar,
+            text="Clear console",
+            width=110,
+            fg_color="transparent",
+            border_width=1,
+            command=self._clear_console,
+        )
+        self.console_clear_button.grid(row=0, column=2, padx=(0, 8))
+
+        self.console_host = ctk.CTkFrame(tab, fg_color="transparent")
+        self.console_host.grid(
+            row=1,
+            column=0,
+            sticky="nsew",
+            padx=8,
+            pady=(0, 8),
+        )
+        self.console_host.grid_columnconfigure(0, weight=1)
+        self.console_host.grid_rowconfigure(0, weight=1)
+
+        self.console_view = ConsoleView(self.console_host)
+        self.console_view.grid(
+            row=0,
+            column=0,
+            sticky="nsew",
+        )
+        self._configure_console_tags()
+        self._append_console(
+            "Umbra console ready. Start the bot to stream live output here.\n",
+            tag="system",
+        )
+
+    def _configure_console_tags(self) -> None:
+        if not hasattr(self, "console_view"):
+            return
+        dark = ctk.get_appearance_mode() == "Dark"
+        if self.appearance_menu.get() == "Umbra":
+            background = "#211820"
+            foreground = "#ffffe7"
+        else:
+            index = 1 if dark else 0
+            background = STANDARD_THEME["CTkTextbox"]["fg_color"][index]
+            foreground = STANDARD_THEME["CTkTextbox"]["text_color"][index]
+        self.console_view.set_palette(
+            background=background,
+            foreground=foreground,
+            system="#8e9b9d" if dark else "#596367",
+            success="#8bd49c" if dark else "#177245",
+            warning="#f0c674" if dark else "#8a5d00",
+            error="#ff8d85" if dark else "#b42318",
+        )
+
+    def _append_console(self, value: str, *, tag: str | None = None) -> None:
+        if not value or not hasattr(self, "console_view"):
+            return
+        cleaned = ANSI_ESCAPE.sub("", value).replace("\r\n", "\n")
+        for line in cleaned.splitlines(keepends=True):
+            line_tag = tag or self._console_line_tag(line)
+            self.console_view.append(line, line_tag)
+
+    @staticmethod
+    def _console_line_tag(line: str) -> str | None:
+        lowered = line.lower()
+        if any(word in lowered for word in ("error", "exception", "traceback")):
+            return "error"
+        if "warning" in lowered or "warn:" in lowered:
+            return "warning"
+        if any(
+            phrase in lowered
+            for phrase in ("logged in", "ready", "synced", "connected")
+        ):
+            return "success"
+        return None
+
+    def _clear_console(self) -> None:
+        self.console_view.clear()
+        self.status_var.set("Console cleared")
+
+    def _clear_console_shortcut(self, _event: object) -> str:
+        self._clear_console()
+        return "break"
+
+    def _toggle_console_follow(self) -> None:
+        self.console_following = not self.console_following
+        state = "On" if self.console_following else "Off"
+        self.console_follow_button.configure(text=f"Follow output: {state}")
+        self.console_view.set_following(self.console_following)
 
     def _build_general_tab(self, tab: ctk.CTkFrame) -> None:
         tab.grid_columnconfigure(0, weight=1)
         tab.grid_rowconfigure(0, weight=1)
         form = ctk.CTkScrollableFrame(tab, fg_color="transparent")
         form.grid(row=0, column=0, sticky="nsew")
+        form._scrollbar.grid_remove()
         form.grid_columnconfigure(0, weight=1)
+        self.general_form = form
 
         account = self._section(
             form,
@@ -526,13 +890,15 @@ class SettingsApp(ctk.CTk):
         tab.grid_rowconfigure(0, weight=1)
         form = ctk.CTkScrollableFrame(tab, fg_color="transparent")
         form.grid(row=0, column=0, sticky="nsew")
+        form._scrollbar.grid_remove()
         form.grid_columnconfigure(0, weight=1)
+        self.messages_form = form
 
         messages = self._section(
             form,
             0,
             "Message templates",
-            "Plain text and Discord markdown are supported.",
+            "Plain text and Discord markdown are supported • 2,000 character maximum.",
         )
         messages.grid_columnconfigure(0, weight=1)
         chooser = ctk.CTkFrame(messages, fg_color="transparent")
@@ -543,6 +909,13 @@ class SettingsApp(ctk.CTk):
             text="Message being edited",
             font=ctk.CTkFont(weight="bold"),
         ).grid(row=0, column=0, sticky="w")
+        self.message_count_label = ctk.CTkLabel(
+            chooser,
+            text=f"0 / {MAX_MESSAGE_LENGTH}",
+            font=ctk.CTkFont(size=11),
+            text_color=("gray38", "gray68"),
+        )
+        self.message_count_label.grid(row=1, column=1, sticky="e", pady=(4, 0))
         self.message_editor_selector = ctk.CTkSegmentedButton(
             chooser,
             width=320,
@@ -566,8 +939,18 @@ class SettingsApp(ctk.CTk):
         editor_host = ctk.CTkFrame(messages, fg_color="transparent")
         editor_host.grid(row=3, column=0, sticky="ew", padx=20, pady=(0, 18))
         editor_host.grid_columnconfigure(0, weight=1)
-        self.pm_text = ctk.CTkTextbox(editor_host, height=300, wrap="word")
-        self.pingpm_text = ctk.CTkTextbox(editor_host, height=300, wrap="word")
+        self.pm_text = LimitedTextbox(
+            editor_host,
+            height=300,
+            wrap="word",
+            max_length=MAX_MESSAGE_LENGTH,
+        )
+        self.pingpm_text = LimitedTextbox(
+            editor_host,
+            height=300,
+            wrap="word",
+            max_length=MAX_MESSAGE_LENGTH,
+        )
         self.pm_text.grid(row=0, column=0, sticky="ew")
         self.pingpm_text.grid(row=0, column=0, sticky="ew")
         self.pingpm_text.grid_remove()
@@ -684,6 +1067,7 @@ class SettingsApp(ctk.CTk):
         selected.grid(row=0, column=0, sticky="ew")
         self.active_message_textbox = selected
         self.message_editor_selector.set(selection)
+        self._update_message_count(selected)
         self._update_message_preview(selected)
 
     def _apply_preview_zoom(self, value: str) -> None:
@@ -717,7 +1101,27 @@ class SettingsApp(ctk.CTk):
         if not textbox._textbox.edit_modified():
             return
         textbox._textbox.edit_modified(False)
+        self._update_message_count(textbox)
         self._update_message_preview(textbox)
+
+    def _update_message_count(self, textbox: ctk.CTkTextbox) -> None:
+        if textbox is not self.active_message_textbox:
+            return
+        length = len(textbox.get("1.0", "end-1c"))
+        if length > MAX_MESSAGE_LENGTH:
+            color = ("#b42318", "#ff8d85")
+        elif length == MAX_MESSAGE_LENGTH:
+            color = ("#9a6700", "#f0c674")
+        else:
+            color = ("gray38", "gray68")
+        self.message_count_label.configure(
+            text=f"{length} / {MAX_MESSAGE_LENGTH}",
+            text_color=color,
+        )
+
+    def _refresh_message_counts(self) -> None:
+        if hasattr(self, "active_message_textbox"):
+            self._update_message_count(self.active_message_textbox)
 
     def _update_message_preview(self, textbox: ctk.CTkTextbox) -> None:
         if textbox is not self.active_message_textbox:
@@ -990,7 +1394,7 @@ class SettingsApp(ctk.CTk):
             command=self._toggle_bot,
         )
         self.bot_button.grid(row=0, column=1, padx=(8, 8), pady=14)
-        ctk.CTkButton(
+        self.reload_button = ctk.CTkButton(
             footer,
             text="Reload",
             width=100,
@@ -1000,13 +1404,15 @@ class SettingsApp(ctk.CTk):
             border_width=1,
             text_color="#ffffe7",
             command=self.load,
-        ).grid(row=0, column=2, padx=(0, 8), pady=14)
-        ctk.CTkButton(
+        )
+        self.reload_button.grid(row=0, column=2, padx=(0, 8), pady=14)
+        self.save_button = ctk.CTkButton(
             footer,
             text="Save settings",
             width=130,
             command=self.save,
-        ).grid(row=0, column=3, padx=(0, 28), pady=14)
+        )
+        self.save_button.grid(row=0, column=3, padx=(0, 28), pady=14)
 
     def _toggle_bot(self) -> None:
         if self.bot_process is not None and self.bot_process.poll() is None:
@@ -1017,7 +1423,7 @@ class SettingsApp(ctk.CTk):
     def _bot_command(self) -> list[str]:
         if getattr(sys, "frozen", False):
             return [sys.executable, PACKAGED_BOT_ARGUMENT]
-        return [sys.executable, "-m", "external_app_raider"]
+        return [sys.executable, "-m", "umbra_bot"]
 
     def _start_bot(self) -> None:
         if not self.save():
@@ -1029,10 +1435,17 @@ class SettingsApp(ctk.CTk):
             self._bot_log_file = self._bot_log_path.open(
                 "a", encoding="utf-8", buffering=1
             )
-            self._bot_log_file.write(
+            started_line = (
                 "\n--- Umbra bot started "
                 f"{datetime.now().isoformat(timespec='seconds')} ---\n"
             )
+            self._bot_log_file.write(started_line)
+            self._bot_log_file.flush()
+            self._bot_log_reader = self._bot_log_path.open(
+                "r", encoding="utf-8", errors="replace"
+            )
+            self._bot_log_reader.seek(0, 2)
+            self._append_console(started_line, tag="system")
             options: dict[str, object] = {
                 "cwd": CONFIG_PATH.parent.parent,
                 "stdout": self._bot_log_file,
@@ -1045,13 +1458,22 @@ class SettingsApp(ctk.CTk):
             self.bot_process = subprocess.Popen(command, **options)
         except (OSError, ValueError) as error:
             self._close_bot_log()
+            self._append_console(
+                f"Could not start the bot: {error}\n", tag="error"
+            )
             messagebox.showerror("Could not start bot", str(error), parent=self)
             self.status_var.set("Could not start the bot")
+            self.console_state_var.set("Failed to start")
             return
 
         self._bot_stop_requested = False
         self.bot_button.configure(text="Stop bot", state="normal")
         self.status_var.set(f"Bot running (PID {self.bot_process.pid})")
+        self.console_state_var.set(f"Running • PID {self.bot_process.pid}")
+        self._append_console(
+            f"Bot process started with PID {self.bot_process.pid}.\n",
+            tag="success",
+        )
         self._schedule_bot_poll()
 
     def _stop_bot(self) -> None:
@@ -1062,6 +1484,8 @@ class SettingsApp(ctk.CTk):
         self._bot_stop_deadline = time.monotonic() + 3
         self.bot_button.configure(text="Stopping…", state="disabled")
         self.status_var.set("Stopping bot…")
+        self.console_state_var.set("Stopping…")
+        self._append_console("Stopping bot…\n", tag="warning")
         try:
             process.terminate()
         except OSError:
@@ -1079,6 +1503,7 @@ class SettingsApp(ctk.CTk):
             return
 
         exit_code = process.poll()
+        self._drain_bot_log()
         if exit_code is None:
             if (
                 self._bot_stop_requested
@@ -1091,6 +1516,7 @@ class SettingsApp(ctk.CTk):
             self._schedule_bot_poll()
             return
 
+        self._drain_bot_log()
         stopped_by_user = self._bot_stop_requested
         self.bot_process = None
         self._bot_stop_requested = False
@@ -1098,17 +1524,46 @@ class SettingsApp(ctk.CTk):
         self.bot_button.configure(text="Start bot", state="normal")
         if stopped_by_user:
             self.status_var.set("Bot stopped")
+            self.console_state_var.set("Stopped")
+            self._append_console("Bot stopped.\n", tag="system")
         elif exit_code == 0:
             self.status_var.set("Bot stopped")
+            self.console_state_var.set("Stopped")
+            self._append_console("Bot process exited normally.\n", tag="system")
         else:
             self.status_var.set(
                 f"Bot exited with code {exit_code}; see {self._bot_log_path}"
             )
+            self.console_state_var.set(f"Exited • code {exit_code}")
+            self._append_console(
+                f"Bot exited with code {exit_code}. Full log: "
+                f"{self._bot_log_path}\n",
+                tag="error",
+            )
+
+    def _drain_bot_log(self) -> None:
+        if self._bot_log_reader is None:
+            return
+        try:
+            output = self._bot_log_reader.read()
+        except (OSError, ValueError) as error:
+            self._append_console(f"Could not read bot output: {error}\n", tag="error")
+            return
+        if output:
+            self._append_console(output)
 
     def _close_bot_log(self) -> None:
         if self._bot_log_file is not None:
+            try:
+                self._bot_log_file.flush()
+            except (OSError, ValueError):
+                pass
             self._bot_log_file.close()
             self._bot_log_file = None
+        self._drain_bot_log()
+        if self._bot_log_reader is not None:
+            self._bot_log_reader.close()
+            self._bot_log_reader = None
 
     def _on_close(self) -> None:
         if self._bot_poll_after_id is not None:
@@ -1124,6 +1579,7 @@ class SettingsApp(ctk.CTk):
                 process.wait()
             except OSError:
                 pass
+        self._drain_bot_log()
         self._close_bot_log()
         self.destroy()
 
@@ -1211,8 +1667,14 @@ class SettingsApp(ctk.CTk):
             self.status_var.set("Could not load the configuration")
 
     def _replace_text(self, textbox: ctk.CTkTextbox, value: str) -> None:
-        textbox.delete("1.0", "end")
-        textbox.insert("1.0", value)
+        if isinstance(textbox, LimitedTextbox):
+            # Load legacy oversized values intact so the counter can flag them
+            # and the user can decide how to shorten them before saving.
+            textbox.replace_contents(value, enforce_limit=False)
+        else:
+            textbox.delete("1.0", "end")
+            textbox.insert("1.0", value)
+        self._update_message_count(textbox)
         self._update_message_preview(textbox)
 
     def save(self) -> bool:
@@ -1231,6 +1693,18 @@ class SettingsApp(ctk.CTk):
                 self.block_seconds_var.get(), "Block seconds"
             )
 
+            standard_message = self.pm_text.get("1.0", "end-1c")
+            notification_message = self.pingpm_text.get("1.0", "end-1c")
+            if len(standard_message) > MAX_MESSAGE_LENGTH:
+                raise ValueError(
+                    f"Standard message cannot exceed {MAX_MESSAGE_LENGTH} characters."
+                )
+            if len(notification_message) > MAX_MESSAGE_LENGTH:
+                raise ValueError(
+                    "Notification message cannot exceed "
+                    f"{MAX_MESSAGE_LENGTH} characters."
+                )
+
             updated = deepcopy(self.current_config)
             updated["token"] = self.token_var.get().strip()
             updated.setdefault("basic_config", {}).update(
@@ -1243,8 +1717,8 @@ class SettingsApp(ctk.CTk):
             )
             updated.setdefault("messages", {}).update(
                 {
-                    "pm": self.pm_text.get("1.0", "end-1c"),
-                    "pingpm": self.pingpm_text.get("1.0", "end-1c"),
+                    "pm": standard_message,
+                    "pingpm": notification_message,
                 }
             )
             updated.setdefault("interface", {}).update(

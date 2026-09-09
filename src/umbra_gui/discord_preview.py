@@ -454,27 +454,34 @@ class DiscordMarkdownView(tk.Text):
             cursor="arrow",
             takefocus=False,
         )
-        scrollbar = tk.Scrollbar(
-            frame,
-            orient="horizontal",
-            command=code.xview,
-            background="#4e5058",
-            troughcolor=DISCORD_CODE_BACKGROUND,
-            borderwidth=0,
-            highlightthickness=0,
-        )
-        code.configure(xscrollcommand=scrollbar.set)
         code.insert("1.0", value)
         code.configure(state="disabled")
         code.pack(fill="x", expand=True)
-
-        longest_line = max(value.splitlines() or [""], key=len)
-        if font.measure(longest_line) > max(1, self.winfo_width() - 30):
-            scrollbar.pack(fill="x", side="bottom")
+        code.bind(
+            "<Shift-MouseWheel>",
+            lambda event, field=code: self._scroll_code_block(field, event),
+        )
+        code.bind(
+            "<Shift-Button-4>",
+            lambda event, field=code: self._scroll_code_block(field, event),
+        )
+        code.bind(
+            "<Shift-Button-5>",
+            lambda event, field=code: self._scroll_code_block(field, event),
+        )
 
         self.window_create("end", window=frame, padx=1, pady=5)
         self._code_blocks.append((frame, code, font))
         self.after_idle(self._resize_code_blocks)
+
+    @staticmethod
+    def _scroll_code_block(code: tk.Text, event: tk.Event) -> str:
+        direction = -1 if getattr(event, "num", None) == 4 else 1
+        delta = getattr(event, "delta", 0)
+        if delta:
+            direction = -1 if delta > 0 else 1
+        code.xview_scroll(direction, "units")
+        return "break"
 
     def _resize_code_blocks(self) -> None:
         available_width = max(140, self.winfo_width() - 18)

@@ -12,12 +12,14 @@ dependencies = [
     "discord>=2.3.2",
     "json5>=0.15.0",
     "pillow>=12.3.0",
+    "textual>=8.2.8",
 ]
 
 [project.scripts]
-external-app-raider = "external_app_raider:main"
+external-app-raider = "umbra_bot:main"
 external-app-raider-config = "umbra_gui:main"
-bot = "external_app_raider:main"
+bot = "umbra_bot:main"
+cli = "umbra_tui:main"
 gui = "umbra_gui:main"
 
 [dependency-groups]
@@ -30,4 +32,4 @@ requires = ["uv_build>=0.12.7,<0.13.0"]
 build-backend = "uv_build"
 
 [tool.uv.build-backend]
-module-name = ["external_app_raider", "umbra_gui"]
+module-name = ["umbra_bot", "umbra_gui", "umbra_tui"]

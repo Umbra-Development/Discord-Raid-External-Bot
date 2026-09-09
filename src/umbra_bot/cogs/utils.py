@@ -4,11 +4,11 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 
-from external_app_raider import config
-from external_app_raider.utils import NotOwner, is_owner
+from umbra_bot import config
+from umbra_bot.utils import NotOwner, is_owner
 
 if TYPE_CHECKING:
-    from external_app_raider.bot import SyraBot
+    from umbra_bot.bot import SyraBot
 
 
 class UtilCog(commands.Cog):

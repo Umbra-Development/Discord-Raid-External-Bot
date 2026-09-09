@@ -28,6 +28,10 @@ choose the Windows `.exe` or Linux executable, and open `Umbra`. Archive copies
 are also provided. Configure your application, then use the built-in control to
 start or stop the bot.
 
+The desktop app opens on **General**. Its **Console** tab streams bot output
+live, with follow and clear controls; scrollbars stay hidden while wheel and
+trackpad scrolling remain available.
+
 For setup instructions, configuration help, troubleshooting, and frequently
 asked questions, visit the **[Umbra Wiki](https://github.com/Umbra-Development/External-App-Raider/wiki)**.
 
@@ -39,7 +43,18 @@ uv sync
 uv run gui
 ```
 
-The standalone bot command is intended for development only:
+Use the responsive terminal dashboard for a colored live log, bot controls,
+and configuration editing:
+
+```bash
+uv run cli
+```
+
+Umbra is the default terminal theme. Press `Ctrl+P` to switch to any of
+Textual's built-in themes.
+
+The plain standalone bot command remains available for development and
+automation:
 
 ```bash
 uv run bot

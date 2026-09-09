@@ -11,12 +11,12 @@ from PyInstaller.utils.hooks import (
 
 ROOT = Path(SPEC).resolve().parent.parent
 ctk_datas, ctk_binaries, ctk_hiddenimports = collect_all("customtkinter")
-app_datas = collect_data_files("external_app_raider")
+app_datas = collect_data_files("umbra_bot")
 gui_datas = collect_data_files("umbra_gui")
 bot_hiddenimports = [
     *collect_submodules("discord"),
-    "external_app_raider.cogs.raid",
-    "external_app_raider.cogs.utils",
+    "umbra_bot.cogs.raid",
+    "umbra_bot.cogs.utils",
 ]
 datas = [
     *ctk_datas,
