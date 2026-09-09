@@ -10,8 +10,6 @@ from external_app_raider.utils import ConfiguredCooldown, check_cooldown
 if TYPE_CHECKING:
     from external_app_raider.bot import SyraBot
 
-
-
 class RaidCog(commands.Cog):
     def __init__(self, bot: "SyraBot") -> None:
         self.bot = bot
